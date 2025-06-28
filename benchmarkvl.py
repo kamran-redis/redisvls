@@ -1,7 +1,7 @@
 import os
 import time
-import argparse
 from contextlib import contextmanager
+import typer
 from redis import Redis
 from redisvl.schema import IndexSchema
 from redisvl.index import SearchIndex
@@ -129,65 +129,39 @@ def query_data(client, schema, dimension, datatype):
     print("Query operation completed successfully!")
 
 
-def main():
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Redis Vector Search Benchmark")
-    parser.add_argument(
-        "--operation", 
-        choices=["load", "query"], 
-        required=True,
-        help="Operation to perform: 'load' to create index and load data, 'query' to perform vector queries"
-    )
-    parser.add_argument(
-        "--index-name",
-        default="redisvl",
-        help="Name of the Redis index (default: redisvl)"
-    )
-    parser.add_argument(
-        "--dimension",
-        type=int,
-        default=960,
-        help="Vector dimension (default: 960)"
-    )
-    parser.add_argument(
-        "--algorithm",
-        choices=["flat", "hnsw"],
-        default="flat",
-        help="Vector search algorithm (default: flat)"
-    )
-    parser.add_argument(
-        "--distance-metric",
-        choices=["cosine", "l2", "ip"],
-        default="cosine",
-        help="Distance metric for vector similarity (default: cosine)"
-    )
-    parser.add_argument(
-        "--datatype",
-        choices=["float32"],
-        default="float32",
-        help="Data type for vectors (default: float32)"
-    )
-    parser.add_argument(
-        "--data-size",
-        type=int,
-        default=1000000,
-        help="Number of embeddings to generate and load (default: 1000000)"
-    )
-    args = parser.parse_args()
-
+def main(
+    operation: str = typer.Argument(..., help="Operation to perform: 'load' to create index and load data, 'query' to perform vector queries"),
+    index_name: str = typer.Option("redisvl", "--index-name", help="Name of the Redis index"),
+    dimension: int = typer.Option(960, "--dimension", help="Vector dimension"),
+    algorithm: str = typer.Option("flat", "--algorithm", help="Vector search algorithm (choices: flat, hnsw)"),
+    distance_metric: str = typer.Option("cosine", "--distance-metric", help="Distance metric for vector similarity (choices: cosine, l2, ip)"),
+    datatype: str = typer.Option("float32", "--datatype", help="Data type for vectors (choices: float32)"),
+    data_size: int = typer.Option(1000000, "--data-size", help="Number of embeddings to generate and load"),
+):
+    """Redis Vector Search Benchmark Tool"""
+    
+    # Validate all choice-based arguments
+    if operation not in ["load", "query"]:
+        typer.echo(f"Error: operation must be either 'load' or 'query', got: {operation}")
+        raise typer.Exit(1)
+    
+    if algorithm not in ["flat", "hnsw"]:
+        typer.echo(f"Error: algorithm must be either 'flat' or 'hnsw', got: {algorithm}")
+        raise typer.Exit(1)
+    
+    if distance_metric not in ["cosine", "l2", "ip"]:
+        typer.echo(f"Error: distance_metric must be one of 'cosine', 'l2', or 'ip', got: {distance_metric}")
+        raise typer.Exit(1)
+    
+    if datatype not in ["float32"]:
+        typer.echo(f"Error: datatype must be 'float32', got: {datatype}")
+        raise typer.Exit(1)
+    
     # If SSL is enabled on the endpoint, use rediss:// as the URL prefix
     REDIS_URL = f"redis://:{REDIS_PASSWORD}@{REDIS_HOST}:{REDIS_PORT}"
     client = Redis.from_url(REDIS_URL)
 
-    # Use parameterized values from command line arguments
-    index_name = args.index_name
-    dimension = args.dimension
-    algorithm = args.algorithm
-    distance_metric = args.distance_metric
-    datatype = args.datatype
-    data_size = args.data_size
-
-    # define the scheama
+    # define the schema
     schema = IndexSchema.from_dict(
         {
             "index": {"name": index_name, "prefix": index_name, "storage_type": "hash"},
@@ -210,11 +184,11 @@ def main():
         }
     )
 
-    if args.operation == "load":
+    if operation == "load":
         load_data(client, schema, index_name, dimension, datatype, data_size)
-    elif args.operation == "query":
+    elif operation == "query":
         query_data(client, schema, dimension, datatype)
 
 
 if __name__ == "__main__":
-    main()
+    typer.run(main)
