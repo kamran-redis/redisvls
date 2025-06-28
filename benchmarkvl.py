@@ -1,5 +1,6 @@
 import os
 import time
+import logging
 from contextlib import contextmanager
 import typer
 from redis import Redis
@@ -9,6 +10,14 @@ from redisvl.query import VectorQuery
 
 import numpy as np
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
 
 @contextmanager
 def timer(operation_name="Operation"):
@@ -16,7 +25,7 @@ def timer(operation_name="Operation"):
     start_time = time.perf_counter()
     yield
     end_time = time.perf_counter()
-    print(f"{operation_name} took: {end_time - start_time:.4f} seconds")
+    logger.info(f"{operation_name} took: {end_time - start_time:.4f} seconds")
 
 
 def generate_fake_embeddings(num_embeddings=10, embedding_dim=128, type=np.float32 ,seed=None):
@@ -50,7 +59,7 @@ def load_data(client, schema, index_name, dimension, datatype, data_size):
         datatype: Data type for vectors
         data_size: Number of embeddings to generate
     """
-    print("=== LOAD OPERATION ===")
+    logger.info("=== LOAD OPERATION ===")
     
     # Create the index note we are setting validation load and also the index is recreated if it exists and dropping the data
     with timer("Index creation"):
@@ -67,17 +76,17 @@ def load_data(client, schema, index_name, dimension, datatype, data_size):
         fake_embeddings = generate_fake_embeddings(
             num_embeddings=data_size, embedding_dim=dimension, type=type, seed=42
         )
-        print("Fake embeddings generated.")
+        logger.info("Fake embeddings generated.")
 
     with timer("Data preparation"):
         data = [{"id": "document:" + str(i), "vector": e.tobytes()} for i, e in enumerate(fake_embeddings)]
-        print("Data prepared for loading into index.")
+        logger.info("Data prepared for loading into index.")
     
     with timer("Data loading into index"):
         index.load(data)
-        print("Data loaded into index.")
+        logger.info("Data loaded into index.")
         
-    print("Load operation completed successfully!")
+    logger.info("Load operation completed successfully!")
 
 
 def query_data(client, schema, dimension, datatype):
@@ -90,7 +99,7 @@ def query_data(client, schema, dimension, datatype):
         dimension: Vector dimension
         datatype: Data type for vectors
     """
-    print("=== QUERY OPERATION ===")
+    logger.info("=== QUERY OPERATION ===")
     
     # Connect to existing index without recreation or validation
     index = SearchIndex(schema, client, validate_on_load=False)
@@ -106,7 +115,7 @@ def query_data(client, schema, dimension, datatype):
         query_embedding = generate_fake_embeddings(
             num_embeddings=1, embedding_dim=dimension, type=type, seed=42
         )[0]
-        print("Query embedding generated.")
+        logger.info("Query embedding generated.")
     
     # Let's query redis
     with timer("Vector query execution"):
@@ -118,10 +127,10 @@ def query_data(client, schema, dimension, datatype):
             return_score=True,
         )
         results = index.query(query)
-        print("Query executed.")
-        print("Results:", len(results))
+        logger.info("Query executed.")
+        logger.debug(f"Results: {len(results)}")
         
-    print("Query operation completed successfully!")
+    logger.info("Query operation completed successfully!")
 
 
 def main(
@@ -135,27 +144,34 @@ def main(
     distance_metric: str = typer.Option("cosine", "--distance-metric", help="Distance metric for vector similarity (choices: cosine, l2, ip)"),
     datatype: str = typer.Option("float32", "--datatype", help="Data type for vectors (choices: float32)"),
     data_size: int = typer.Option(1000000, "--data-size", help="Number of embeddings to generate and load"),
+    log_level: str = typer.Option("INFO", "--log-level", help="Logging level (choices: DEBUG, INFO, WARNING, ERROR, CRITICAL)"),
 ):
     """Redis Vector Search Benchmark Tool"""
     
+    # Set log level based on user input
+    numeric_level = getattr(logging, log_level.upper(), None)
+    if not isinstance(numeric_level, int):
+        typer.echo(f"Error: Invalid log level: {log_level}")
+        raise typer.Exit(1)
+    logger.setLevel(numeric_level)
+    
     # Validate all choice-based arguments
     if operation not in ["load", "query"]:
-        typer.echo(f"Error: operation must be either 'load' or 'query', got: {operation}")
+        logger.error(f"operation must be either 'load' or 'query', got: {operation}")
         raise typer.Exit(1)
     
     if algorithm not in ["flat", "hnsw"]:
-        typer.echo(f"Error: algorithm must be either 'flat' or 'hnsw', got: {algorithm}")
+        logger.error(f"algorithm must be either 'flat' or 'hnsw', got: {algorithm}")
         raise typer.Exit(1)
     
     if distance_metric not in ["cosine", "l2", "ip"]:
-        typer.echo(f"Error: distance_metric must be one of 'cosine', 'l2', or 'ip', got: {distance_metric}")
+        logger.error(f"distance_metric must be one of 'cosine', 'l2', or 'ip', got: {distance_metric}")
         raise typer.Exit(1)
     
     if datatype not in ["float32"]:
-        typer.echo(f"Error: datatype must be 'float32', got: {datatype}")
+        logger.error(f"datatype must be 'float32', got: {datatype}")
         raise typer.Exit(1)
     
-    # If SSL is enabled on the endpoint, use rediss:// as the URL prefix
     REDIS_URL = f"redis://:{redis_password}@{redis_host}:{redis_port}"
     client = Redis.from_url(REDIS_URL)
 
