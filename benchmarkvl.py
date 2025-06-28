@@ -10,11 +10,6 @@ from redisvl.query import VectorQuery
 import numpy as np
 
 
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = os.getenv("REDIS_PORT", "6379")  # ex: 18374
-REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")  # ex: "1TNxTEdYRDgIDKM2gDfasupCADXXXX"
-
-
 @contextmanager
 def timer(operation_name="Operation"):
     """Context manager for timing operations."""
@@ -131,6 +126,9 @@ def query_data(client, schema, dimension, datatype):
 
 def main(
     operation: str = typer.Argument(..., help="Operation to perform: 'load' to create index and load data, 'query' to perform vector queries"),
+    redis_host: str = typer.Option("localhost", "--redis-host", help="Redis server hostname"),
+    redis_port: int = typer.Option(6379, "--redis-port", help="Redis server port"),
+    redis_password: str = typer.Option("", "--redis-password", help="Redis server password"),
     index_name: str = typer.Option("redisvl", "--index-name", help="Name of the Redis index"),
     dimension: int = typer.Option(960, "--dimension", help="Vector dimension"),
     algorithm: str = typer.Option("flat", "--algorithm", help="Vector search algorithm (choices: flat, hnsw)"),
@@ -158,7 +156,7 @@ def main(
         raise typer.Exit(1)
     
     # If SSL is enabled on the endpoint, use rediss:// as the URL prefix
-    REDIS_URL = f"redis://:{REDIS_PASSWORD}@{REDIS_HOST}:{REDIS_PORT}"
+    REDIS_URL = f"redis://:{redis_password}@{redis_host}:{redis_port}"
     client = Redis.from_url(REDIS_URL)
 
     # define the schema
