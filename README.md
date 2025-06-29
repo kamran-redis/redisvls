@@ -36,7 +36,7 @@ A simple benchmarking tool for Redis Vector Search performance testing using Red
 
 2. **Create a virtual environment** (recommended):
    ```bash
-   python -m venv venv
+   python3 -m venv venv
    source venv/bin/activate  # On Windows: venv\Scripts\activate
    ```
 
@@ -100,6 +100,7 @@ python benchmarkvl.py query \
 | `--algorithm` | Vector search algorithm | `flat` |
 | `--distance-metric` | Distance metric for similarity | `cosine` |
 | `--datatype` | Data type for vectors | `float32` |
+| `--include-id/--no-id` | Include ID field in schema (enables document identification) | `--include-id` |
 
 ### Load Operation Options
 
@@ -201,6 +202,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Dependencies
 
-- Built with [RedisVL](https://github.com/RedisVentures/redisvl)
-- CLI interface using [Typer](https://typer.tiangolo.com/)
+- Built with [RedisVL](https://github.com/RedisVentures/redisvl) (v0.8.0)
+- CLI interface using [Typer](https://typer.tiangolo.com/) (v0.9.0+)
 - Performance utilities using [NumPy](https://numpy.org/) 
