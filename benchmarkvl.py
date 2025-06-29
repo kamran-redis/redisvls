@@ -7,6 +7,13 @@ from redis import Redis
 from redisvl.schema import IndexSchema
 from redisvl.index import SearchIndex
 from redisvl.query import VectorQuery
+from utils import (
+    print_table_header, 
+    print_table_footer, 
+    calculate_and_print_live_stats, 
+    calculate_and_print_final_stats,
+    print_benchmark_config
+)
 
 import numpy as np
 
@@ -108,29 +115,69 @@ def load_data(client, schema, data_size, dimension, datatype):
         
 
 
-def query_data(client, schema, dimension, datatype):
-    """Query operation: perform vector search queries."""
-    logger.info("=== QUERY OPERATION ===")
+def query_data(client, schema, dimension, datatype, query_count=100, num_results=10):
+    """Query operation: perform vector search queries and measure latency."""
+    logger.info(f"Running {query_count} queries, returning {num_results} results each")
     
     # Connect to existing index
     index = SearchIndex(schema, client, validate_on_load=False)
     
-    # Generate query embedding
-    with timer("Generating and executing query"):
-        query_embedding = generate_fake_embeddings(1, dimension, datatype)[0]
-        logger.info("Query embedding generated.")
-        
-        # Execute query
-        query = VectorQuery(
-            vector=query_embedding,
-            vector_field_name="vector",
-            num_results=3,
-            return_fields=["vector"],
-            return_score=True,
-        )
-        results = index.query(query)
-        logger.info(f"Query executed. Found {len(results)} results.")
-        
+    # Initialize list to store latency measurements
+    latencies = []
+    
+    # Generate query embeddings ahead of time to avoid impacting latency measurement
+    with timer("Generating query embeddings"):
+        query_embeddings = generate_fake_embeddings(query_count, dimension, datatype)
+        logger.info(f"Generated {query_count} query embeddings.")
+    
+    # Print header for real-time results
+    print_table_header()
+    
+    # Execute queries and measure latency
+    successful_queries = 0
+    start_benchmark = time.perf_counter()
+    last_print_time = start_benchmark
+    
+    for i in range(query_count):
+        try:
+            # Start timing
+            start_time = time.perf_counter()
+            
+            # Execute query
+            query = VectorQuery(
+                vector=query_embeddings[i],
+                vector_field_name="vector",
+                num_results=num_results,
+                return_fields=["vector"],
+                return_score=True,
+            )
+            results = index.query(query)
+            
+            # End timing
+            end_time = time.perf_counter()
+            
+            # Record latency in milliseconds
+            latency_ms = (end_time - start_time) * 1000
+            latencies.append(latency_ms)
+            successful_queries += 1
+            
+            # Print intermediate results every 1 second
+            current_time = time.perf_counter()
+            if current_time - last_print_time >= 1.0 or i == query_count - 1:
+                elapsed_time = current_time - start_benchmark
+                success_rate = (successful_queries / (i + 1)) * 100
+                qps = successful_queries / elapsed_time if elapsed_time > 0 else 0
+                
+                calculate_and_print_live_stats(latencies, elapsed_time, i+1, success_rate, qps)
+                last_print_time = current_time
+                
+        except Exception as e:
+            logger.error(f"Query {i + 1} failed: {e}")
+    
+    # Calculate and display final statistics
+    total_time = time.perf_counter() - start_benchmark
+    calculate_and_print_final_stats(latencies, successful_queries, query_count, total_time)
+    
     logger.info("Query operation completed successfully!")
 
 
@@ -144,17 +191,11 @@ def main(
     algorithm: str = typer.Option("flat", "--algorithm", help="Vector search algorithm (choices: flat, hnsw)"),
     distance_metric: str = typer.Option("cosine", "--distance-metric", help="Distance metric for vector similarity (choices: cosine, l2, ip)"),
     datatype: str = typer.Option("float32", "--datatype", help="Data type for vectors (choices: float32)"),
-    data_size: int = typer.Option(1000000, "--data-size", help="Number of embeddings to generate and load"),
-    log_level: str = typer.Option("INFO", "--log-level", help="Logging level (choices: DEBUG, INFO, WARNING, ERROR, CRITICAL)"),
+    data_size: int = typer.Option(1000000, "--data-size", help="Number of embeddings to generate and load (used for 'load' operation)"),
+    query_count: int = typer.Option(100, "--query-count", help="Number of queries to run (used for 'query' operation)"),
+    num_results: int = typer.Option(3, "--num-results", help="Number of results to return per query (used for 'query' operation)"),
 ):
     """Redis Vector Search Benchmark Tool"""
-    
-    # Set log level
-    numeric_level = getattr(logging, log_level.upper(), None)
-    if not isinstance(numeric_level, int):
-        typer.echo(f"Error: Invalid log level: {log_level}")
-        raise typer.Exit(1)
-    logger.setLevel(numeric_level)
     
     # Validate all arguments
     validate_choice_argument(operation, SUPPORTED_OPERATIONS, "operation")
@@ -162,9 +203,31 @@ def main(
     validate_choice_argument(distance_metric, SUPPORTED_DISTANCE_METRICS, "distance_metric")
     validate_choice_argument(datatype, SUPPORTED_DATATYPES, "datatype")
     
+    # Validate query-specific parameters
+    if operation == "query":
+        if query_count <= 0:
+            logger.error("query_count must be greater than 0")
+            raise typer.Exit(1)
+        if num_results <= 0:
+            logger.error("num_results must be greater than 0")
+            raise typer.Exit(1)
+    
     # Setup Redis connection
     redis_url = f"redis://:{redis_password}@{redis_host}:{redis_port}"
-    client = Redis.from_url(redis_url)
+    
+    try:
+        client = Redis.from_url(redis_url)
+        # Test the connection with a ping
+        client.ping()
+    except Exception as e:
+        logger.error(f"Failed to connect to Redis at {redis_host}:{redis_port}: {e}")
+        raise typer.Exit(1)
+    
+    # Print configuration
+    print_benchmark_config(
+        operation, redis_host, redis_port, index_name, dimension,
+        algorithm, distance_metric, datatype, data_size, query_count, num_results
+    )
     
     # Create schema
     schema = create_schema(index_name, dimension, distance_metric, algorithm, datatype)
@@ -173,7 +236,7 @@ def main(
     if operation == "load":
         load_data(client, schema, data_size, dimension, datatype)
     elif operation == "query":
-        query_data(client, schema, dimension, datatype)
+        query_data(client, schema, dimension, datatype, query_count, num_results)
 
 
 if __name__ == "__main__":
