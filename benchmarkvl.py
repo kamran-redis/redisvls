@@ -67,30 +67,35 @@ def generate_fake_embeddings(num_embeddings, embedding_dim, datatype_str, seed=D
     return embeddings
 
 
-def create_schema(index_name, dimension, distance_metric, algorithm, datatype):
+def create_schema(index_name, dimension, distance_metric, algorithm, datatype, include_id=True):
     """Create and return the index schema."""
+    fields = [
+        {
+            "name": "vector",
+            "type": "vector",
+            "attrs": {
+                "dims": dimension,
+                "distance_metric": distance_metric,
+                "algorithm": algorithm,
+                "datatype": datatype,
+            },
+        }
+    ]
+    
+    # Conditionally add ID field
+    if include_id:
+        fields.append({
+            "name": "id",
+            "type": "text",
+        })
+    
     return IndexSchema.from_dict({
         "index": {"name": index_name, "prefix": index_name, "storage_type": "hash"},
-        "fields": [
-            {
-                "name": "vector",
-                "type": "vector",
-                "attrs": {
-                    "dims": dimension,
-                    "distance_metric": distance_metric,
-                    "algorithm": algorithm,
-                    "datatype": datatype,
-                },
-            },
-            {
-                "name": "id",
-                "type": "text",
-            },
-        ],
+        "fields": fields,
     })
 
 
-def load_data(client, schema, data_size, dimension, datatype):
+def load_data(client, schema, data_size, dimension, datatype, include_id=True):
     """Load data operation: create index and load embeddings."""
     logger.info("=== LOAD OPERATION ===")
     
@@ -103,10 +108,12 @@ def load_data(client, schema, data_size, dimension, datatype):
     with timer("Generating fake embeddings"):
         fake_embeddings = generate_fake_embeddings(data_size, dimension, datatype)
 
-
     # Prepare data
     with timer("Data preparation "):
-        data = [{"id": f"document:{i}", "vector": e.tobytes()} for i, e in enumerate(fake_embeddings)]
+        if include_id:
+            data = [{"id": f"document:{i}", "vector": e.tobytes()} for i, e in enumerate(fake_embeddings)]
+        else:
+            data = [{"vector": e.tobytes()} for e in fake_embeddings]
   
     with timer("Data Loading into index"):
         logger.info("Starting data loading into index.")
@@ -194,6 +201,7 @@ def main(
     data_size: int = typer.Option(1000000, "--data-size", help="Number of embeddings to generate and load (used for 'load' operation)"),
     query_count: int = typer.Option(100, "--query-count", help="Number of queries to run (used for 'query' operation)"),
     num_results: int = typer.Option(3, "--num-results", help="Number of results to return per query (used for 'query' operation)"),
+    include_id: bool = typer.Option(True, "--include-id/--no-id", help="Include ID field in schema (default: True)"),
 ):
     """Redis Vector Search Benchmark Tool"""
     
@@ -226,15 +234,15 @@ def main(
     # Print configuration
     print_benchmark_config(
         operation, redis_host, redis_port, index_name, dimension,
-        algorithm, distance_metric, datatype, data_size, query_count, num_results
+        algorithm, distance_metric, datatype, data_size, query_count, num_results, include_id
     )
     
     # Create schema
-    schema = create_schema(index_name, dimension, distance_metric, algorithm, datatype)
+    schema = create_schema(index_name, dimension, distance_metric, algorithm, datatype, include_id)
     
     # Execute operation
     if operation == "load":
-        load_data(client, schema, data_size, dimension, datatype)
+        load_data(client, schema, data_size, dimension, datatype, include_id)
     elif operation == "query":
         query_data(client, schema, dimension, datatype, query_count, num_results)
 
