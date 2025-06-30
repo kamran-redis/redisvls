@@ -101,7 +101,7 @@ def load_data(client, schema, data_size, dimension, datatype, include_id=True):
     
     # Create the index
     with timer("Index creation"):
-        index = SearchIndex(schema, client, validate_on_load=True)
+        index = SearchIndex(schema, client, validate_on_load=False)
         index.create(overwrite=True, drop=True)
     
     # Generate embeddings
