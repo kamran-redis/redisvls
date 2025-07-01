@@ -286,31 +286,100 @@ def execute_single_query(schema, connection_pool, query_embedding, num_results, 
         pass
 
 
-def query_data_concurrent(client, schema, query_embeddings, num_results, max_workers):
-    """Execute queries concurrently using connection pool."""
+def _execute_query(index, query_embedding, num_results, query_id):
+    """Helper function to execute a single query and return timing/result info."""
+    try:
+        start_time = time.perf_counter()
+        
+        query = VectorQuery(
+            vector=query_embedding.tolist(),
+            vector_field_name="vector",
+            num_results=num_results,
+            return_fields=["vector"],
+            return_score=True,
+        )
+        results = index.query(query)
+        
+        end_time = time.perf_counter()
+        latency_ms = (end_time - start_time) * 1000
+        
+        return {
+            'query_id': query_id,
+            'latency_ms': latency_ms,
+            'success': True,
+            'results': results
+        }
+    except Exception as e:
+        logger.error(f"Query {query_id} failed: {e}")
+        return {
+            'query_id': query_id,
+            'latency_ms': None,
+            'success': False,
+            'error': str(e)
+        }
+
+
+def _process_query_results(latencies, successful_queries, completed_queries, total_queries, start_time, last_print_time):
+    """Helper function to calculate and print live statistics during query execution."""
+    current_time = time.perf_counter()
+    should_print = (current_time - last_print_time >= 1.0) or (completed_queries == total_queries)
     
-    # Create connection pool (reuse client's connection config)
+    if should_print:
+        elapsed_time = current_time - start_time
+        success_rate = (successful_queries / completed_queries) * 100 if completed_queries > 0 else 0
+        qps = successful_queries / elapsed_time if elapsed_time > 0 else 0
+        calculate_and_print_live_stats(latencies, elapsed_time, completed_queries, success_rate, qps)
+        return current_time
+    
+    return last_print_time
+
+
+def _run_queries_single_threaded(index, query_embeddings, num_results):
+    """Execute queries in single-threaded mode."""
+    latencies = []
+    successful_queries = 0
+    start_time = time.perf_counter()
+    last_print_time = start_time
+    
+    for i, embedding in enumerate(query_embeddings):
+        result = _execute_query(index, embedding, num_results, i)
+        
+        if result['success']:
+            latencies.append(result['latency_ms'])
+            successful_queries += 1
+        
+        # Update live statistics
+        last_print_time = _process_query_results(
+            latencies, successful_queries, i + 1, len(query_embeddings), start_time, last_print_time
+        )
+    
+    total_time = time.perf_counter() - start_time
+    failed_queries = len(query_embeddings) - successful_queries
+    
+    return latencies, successful_queries, failed_queries, total_time
+
+
+def _run_queries_concurrent(client, schema, query_embeddings, num_results, max_workers):
+    """Execute queries in concurrent mode using connection pool."""
+    # Create connection pool
     connection_kwargs = client.connection_pool.connection_kwargs.copy()
     pool = ConnectionPool(
         host=connection_kwargs.get('host', 'localhost'),
         port=connection_kwargs.get('port', 6379),
         password=connection_kwargs.get('password', None),
         db=connection_kwargs.get('db', 0),
-        max_connections=max_workers + 2  # Extra connections for safety
+        max_connections=max_workers + 2
     )
     
-    # Track results in thread-safe way
+    # Thread-safe result tracking
     results_lock = threading.Lock()
     latencies = []
     successful_queries = 0
     failed_queries = 0
     completed_queries = 0
     
-    # Print header for real-time results
-    print_table_header()
-    
-    start_benchmark = time.perf_counter()
-    last_print_time = start_benchmark
+    start_time = time.perf_counter()
+    last_print_time = start_time
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all query tasks
@@ -319,14 +388,13 @@ def query_data_concurrent(client, schema, query_embeddings, num_results, max_wor
             for i, embedding in enumerate(query_embeddings)
         }
         
-        # Process completed tasks as they finish
+        # Process completed tasks
         for future in as_completed(future_to_query):
             query_id = future_to_query[future]
             
             try:
                 result = future.result()
                 
-                # Thread-safe result collection
                 with results_lock:
                     completed_queries += 1
                     
@@ -336,13 +404,12 @@ def query_data_concurrent(client, schema, query_embeddings, num_results, max_wor
                     else:
                         failed_queries += 1
                     
-                    # Print intermediate results every 1 second or on completion
+                    # Update live statistics
                     current_time = time.perf_counter()
                     if current_time - last_print_time >= 1.0 or completed_queries == len(query_embeddings):
-                        elapsed_time = current_time - start_benchmark
+                        elapsed_time = current_time - start_time
                         success_rate = (successful_queries / completed_queries) * 100 if completed_queries > 0 else 0
                         qps = successful_queries / elapsed_time if elapsed_time > 0 else 0
-                        
                         calculate_and_print_live_stats(latencies, elapsed_time, completed_queries, success_rate, qps)
                         last_print_time = current_time
                         
@@ -352,10 +419,10 @@ def query_data_concurrent(client, schema, query_embeddings, num_results, max_wor
                     failed_queries += 1
                     completed_queries += 1
     
-    # Close connection pool
     pool.disconnect()
+    total_time = time.perf_counter() - start_time
     
-    return latencies, successful_queries, failed_queries
+    return latencies, successful_queries, failed_queries, total_time
 
 
 def query_data(client, schema, dimension, datatype, query_count=100, num_results=10, max_workers=1):
@@ -365,79 +432,28 @@ def query_data(client, schema, dimension, datatype, query_count=100, num_results
     # Connect to existing index
     index = SearchIndex(schema, client, validate_on_load=False)
     
-    # Generate query embeddings ahead of time to avoid impacting latency measurement
+    # Generate query embeddings ahead of time
     with timer("Generating query embeddings"):
         query_embeddings = generate_fake_embeddings(query_count, dimension, datatype)
         logger.info(f"Generated {query_count} query embeddings.")
     
+    # Print header for real-time results
+    print_table_header()
+    
+    # Execute queries based on worker count
     if max_workers == 1:
-        # Single-threaded path (original behavior)
-        logger.info("Running queries in single-threaded mode")
-        
-        # Initialize list to store latency measurements
-        latencies = []
-        
-        # Print header for real-time results
-        print_table_header()
-        
-        # Execute queries and measure latency
-        successful_queries = 0
-        start_benchmark = time.perf_counter()
-        last_print_time = start_benchmark
-        
-        for i in range(query_count):
-            try:
-                # Start timing
-                start_time = time.perf_counter()
-                
-                # Execute query
-                query = VectorQuery(
-                    vector=query_embeddings[i].tolist(),  # Convert numpy array to list
-                    vector_field_name="vector",
-                    num_results=num_results,
-                    return_fields=["vector"],
-                    return_score=True,
-                )
-                results = index.query(query)
-                
-                # End timing
-                end_time = time.perf_counter()
-                
-                # Record latency in milliseconds
-                latency_ms = (end_time - start_time) * 1000
-                latencies.append(latency_ms)
-                successful_queries += 1
-                
-                # Print intermediate results every 1 second
-                current_time = time.perf_counter()
-                if current_time - last_print_time >= 1.0 or i == query_count - 1:
-                    elapsed_time = current_time - start_benchmark
-                    success_rate = (successful_queries / (i + 1)) * 100
-                    qps = successful_queries / elapsed_time if elapsed_time > 0 else 0
-                    
-                    calculate_and_print_live_stats(latencies, elapsed_time, i+1, success_rate, qps)
-                    last_print_time = current_time
-                    
-            except Exception as e:
-                logger.error(f"Query {i + 1} failed: {e}")
-        
-        total_time = time.perf_counter() - start_benchmark
-        failed_queries = query_count - successful_queries
-        
+        #logger.info("Running queries in single-threaded mode")
+        latencies, successful_queries, failed_queries, total_time = _run_queries_single_threaded(
+            index, query_embeddings, num_results
+        )
     else:
-        # Multi-threaded path
-        logger.info(f"Running queries in concurrent mode with {max_workers} workers")
-        start_benchmark = time.perf_counter()
-        
-        latencies, successful_queries, failed_queries = query_data_concurrent(
+        #logger.info(f"Running queries in concurrent mode with {max_workers} workers")
+        latencies, successful_queries, failed_queries, total_time = _run_queries_concurrent(
             client, schema, query_embeddings, num_results, max_workers
         )
-        
-        total_time = time.perf_counter() - start_benchmark
     
     # Calculate and display final statistics
     calculate_and_print_final_stats(latencies, successful_queries, query_count, total_time)
-    
     logger.info("Query operation completed successfully!")
 
 

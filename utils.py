@@ -88,10 +88,11 @@ def print_benchmark_config(operation, redis_host, redis_port, index_name, dimens
     print(f"Index Name:      {index_name}")
     print(f"Vector Config:   {dimension}D, {algorithm.upper()}, {distance_metric}, {datatype}")
     print(f"Include ID:      {'Yes' if include_id else 'No'}")
+    print(f"Workers:         {max_workers} ({'single-threaded' if max_workers == 1 else 'multi-threaded'})")
     
     if operation == "load" and data_size is not None:
         print(f"Data Size:       {data_size:,} embeddings")
-        print(f"Workers:         {max_workers} ({'single-threaded' if max_workers == 1 else 'multi-threaded'})")
+        
     elif operation == "query" and query_count is not None and num_results is not None:
         print(f"Query Config:    {query_count:,} queries, {num_results} results each")
     
