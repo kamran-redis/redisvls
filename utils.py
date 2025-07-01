@@ -78,7 +78,7 @@ def calculate_and_print_final_stats(latencies, successful_queries, query_count, 
 
 def print_benchmark_config(operation, redis_host, redis_port, index_name, dimension, 
                           algorithm, distance_metric, datatype, data_size=None, 
-                          query_count=None, num_results=None, include_id=True):
+                          query_count=None, num_results=None, include_id=True, max_workers=1):
     """Print benchmark configuration in a succinct format."""
     print("\n" + "=" * 80)
     print("REDIS VECTOR SEARCH BENCHMARK CONFIGURATION")
@@ -91,6 +91,7 @@ def print_benchmark_config(operation, redis_host, redis_port, index_name, dimens
     
     if operation == "load" and data_size is not None:
         print(f"Data Size:       {data_size:,} embeddings")
+        print(f"Workers:         {max_workers} ({'single-threaded' if max_workers == 1 else 'multi-threaded'})")
     elif operation == "query" and query_count is not None and num_results is not None:
         print(f"Query Config:    {query_count:,} queries, {num_results} results each")
     
