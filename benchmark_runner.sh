@@ -3,7 +3,7 @@
 # Simple bash script to iterate over Redis hosts, ports, algorithms, operations, and worker counts
 # for Redis Vector Library benchmarking
 
-set -e  # Exit on any error
+ 
 
 # Define arrays for iteration - paired host:port combinations
 redis_hosts=("localhost" "redis-12000.internal.cluster.kamran-default.demo.redislabs.com" "redis-13000.internal.cluster.kamran-default.demo.redislabs.com" "redis-14000.internal.cluster.kamran-default.demo.redislabs.com" "redis-15000.internal.cluster.kamran-default.demo.redislabs.com" "redis-16000.internal.cluster.kamran-default.demo.redislabs.com")
@@ -33,11 +33,25 @@ for i in "${!redis_hosts[@]}"; do
                 echo "Running: host=$redis_host, port=$redis_port, algorithm=$algorithm, operation=$operation, workers=$worker_count"
                 echo ""
                 
-                if python benchmarkvl.py "$operation" \
-                    --algorithm "$algorithm" \
-                    --max-workers "$worker_count" \
-                    --redis-host "$redis_host" \
-                    --redis-port "$redis_port"; then
+                # Set query count based on algorithm
+                if [[ "$algorithm" == "hnsw" ]]; then
+                    query_count=10000
+                else
+                    query_count=1000
+                fi
+                
+                # Build command arguments
+                cmd_args=(
+                    "$operation"
+                    --algorithm "$algorithm"
+                    --max-workers "$worker_count"
+                    --redis-host "$redis_host"
+                    --redis-port "$redis_port"
+                    --query-count "$query_count"
+                    --data-size 1000000
+                )
+                
+                if python benchmarkvl.py "${cmd_args[@]}"; then
                     echo "✓ Operation $current_op completed successfully"
                 else
                     echo "✗ Operation $current_op failed"
