@@ -15,7 +15,7 @@ curl -vvv -k -X "POST" "$RS_URL/v1/bdbs" \
   "shards_count": 1,
   "module_list": [
     {
-      "module_name": "search"
+      "module_name": "search",
       "module_args": ""
     }
   ],
