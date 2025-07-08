@@ -70,6 +70,18 @@ def generate_fake_embeddings(num_embeddings, embedding_dim, datatype_str, seed=D
     return embeddings
 
 
+def generate_fake_embeddings_range(start_id, count, embedding_dim, datatype_str, seed=DEFAULT_SEED):
+    """Generate fake embeddings for a specific ID range using deterministic seeding."""
+    # Use the start_id as an offset to ensure different workers generate different data
+    # but still deterministically based on the base seed
+    if seed is not None:
+        np.random.seed(seed + start_id)
+
+    dtype = get_numpy_dtype(datatype_str)
+    embeddings = np.random.rand(count, embedding_dim).astype(dtype)
+    return embeddings
+
+
 def create_schema(index_name, dimension, distance_metric, algorithm, datatype, include_id=True):
     """Create and return the index schema."""
     fields = [
@@ -98,56 +110,87 @@ def create_schema(index_name, dimension, distance_metric, algorithm, datatype, i
     })
 
 
-def split_data_into_chunks(data, max_workers):
-    """Split data into chunks with similar sizes, last chunk may be smaller."""
-    if max_workers >= len(data):
-        # More workers than data points - each worker gets 1 item max
-        return [[item] for item in data]
-    
-    chunk_size = len(data) // max_workers
-    chunks = []
-    
-    for i in range(max_workers):
-        start_idx = i * chunk_size
-        if i == max_workers - 1:  # Last chunk gets all remaining data
-            end_idx = len(data)
-        else:
-            end_idx = (i + 1) * chunk_size
-        
-        chunk = data[start_idx:end_idx]
-        chunks.append(chunk)
-    
-    return chunks
-
-
-def load_chunk_with_pool(schema, connection_pool, data_chunk, chunk_id):
-    """Load a chunk using a connection from the pool."""
+def load_chunk_with_pipeline(connection_pool, index_name, start_id, count, dimension, datatype, include_id, chunk_id, batch_size=1000):
+    """Load a chunk using Redis pipeline without transactions for efficient batching."""
     
     # Get connection from pool
     redis_client = Redis(connection_pool=connection_pool)
-    
+
     try:
-        # Create SearchIndex with pooled connection
-        worker_index = SearchIndex(schema, redis_client, validate_on_load=False)
-        
-        # Load the chunk
-        worker_index.load(data_chunk)
-        
-        return len(data_chunk)
-        
+        total_loaded = 0
+
+        # Process in smaller batches to manage memory
+        for batch_start in range(0, count, batch_size):
+            batch_count = min(batch_size, count - batch_start)
+            current_start_id = start_id + batch_start
+
+            # Generate embeddings just-in-time for this batch
+            batch_embeddings = generate_fake_embeddings_range(
+                current_start_id, batch_count, dimension, datatype
+            )
+
+            # Create pipeline without transactions for better performance
+            pipe = redis_client.pipeline(transaction=False)
+
+            # Add all batch operations to pipeline
+            for i, embedding in enumerate(batch_embeddings):
+                doc_id = current_start_id + i
+
+                # Prepare the hash fields
+                hash_key = f"{index_name}:{doc_id}"
+                fields = {"vector": embedding.tobytes()}
+
+                if include_id:
+                    fields["id"] = f"document:{doc_id}"
+
+                # Add to pipeline
+                pipe.hset(hash_key, mapping=fields)
+
+            # Execute the batch
+            pipe.execute()
+            total_loaded += batch_count
+
+            # Optional: Log progress for large chunks
+            if batch_start + batch_count < count:
+                logger.debug(f"Chunk {chunk_id}: Loaded {total_loaded}/{count} records")
+
+        logger.info(f"Chunk {chunk_id} completed: {total_loaded} records loaded")
+        return total_loaded
+
     except Exception as e:
-        # Log the error but let it propagate to be handled by the executor
-        logger.error(f"Worker {chunk_id} error loading {len(data_chunk)} records: {e}")
+        logger.error(f"Worker {chunk_id} error loading {count} records starting from ID {start_id}: {e}")
         raise
-    
+
     finally:
         # Connection automatically returns to pool when redis_client goes out of scope
         pass
 
 
-def load_data_concurrent(client, schema, data, max_workers):
-    """Load data concurrently using connection pool."""
-    
+def calculate_id_ranges(data_size, max_workers):
+    """Calculate ID ranges for each worker to ensure even distribution."""
+    ranges = []
+
+    if max_workers >= data_size:
+        # More workers than data points - each worker gets 1 item max
+        for i in range(data_size):
+            ranges.append((i, 1))
+    else:
+        chunk_size = data_size // max_workers
+
+        for i in range(max_workers):
+            start_id = i * chunk_size
+            if i == max_workers - 1:  # Last chunk gets all remaining data
+                count = data_size - start_id
+            else:
+                count = chunk_size
+            ranges.append((start_id, count))
+
+    return ranges
+
+
+def load_data_concurrent_pipeline(client, schema, data_size, dimension, datatype, include_id, max_workers):
+    """Load data concurrently using Redis pipelining for improved performance and memory usage."""
+
     # Create connection pool (reuse client's connection config)
     connection_kwargs = client.connection_pool.connection_kwargs.copy()
     pool = ConnectionPool(
@@ -158,9 +201,9 @@ def load_data_concurrent(client, schema, data, max_workers):
         max_connections=max_workers + 2  # Extra connections for safety
     )
     
-    # Split data into chunks
-    chunks = split_data_into_chunks(data, max_workers)
-    logger.info(f"Split {len(data)} records into {len(chunks)} chunks for {max_workers} workers")
+    # Calculate ID ranges for workers
+    id_ranges = calculate_id_ranges(data_size, max_workers)
+    logger.info(f"Split {data_size} records into {len(id_ranges)} ranges for {max_workers} workers")
     
     # Track results
     successful_chunks = 0
@@ -170,41 +213,93 @@ def load_data_concurrent(client, schema, data, max_workers):
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all chunk loading tasks
-        future_to_chunk = {
-            executor.submit(load_chunk_with_pool, schema, pool, chunk, i): (chunk, i) 
-            for i, chunk in enumerate(chunks)
+        future_to_range = {
+            executor.submit(
+                load_chunk_with_pipeline,
+                pool,
+                schema.index.name,  # Get index name from schema
+                start_id,
+                count,
+                dimension,
+                datatype,
+                include_id,
+                i
+            ): (start_id, count, i)
+            for i, (start_id, count) in enumerate(id_ranges)
         }
         
         # Process completed tasks as they finish
-        for future in as_completed(future_to_chunk):
-            chunk, chunk_id = future_to_chunk[future]
+        for future in as_completed(future_to_range):
+            start_id, count, chunk_id = future_to_range[future]
             
             try:
                 records_loaded = future.result()
                 successful_chunks += 1
                 total_loaded += records_loaded
-                logger.info(f"Chunk {chunk_id} completed: {records_loaded} records loaded")
+                logger.info(f"Range {chunk_id} (IDs {start_id}-{start_id + count - 1}) completed: {records_loaded} records loaded")
                 
             except Exception as e:
                 failed_chunks += 1
-                error_msg = f"Chunk {chunk_id} failed: {str(e)}"
+                error_msg = f"Range {chunk_id} (IDs {start_id}-{start_id + count - 1}) failed: {str(e)}"
                 errors.append(error_msg)
                 logger.error(error_msg)
                 # Continue with other chunks - don't stop execution
     
     # Final reporting
-    logger.info(f"Loading completed: {successful_chunks}/{len(chunks)} chunks successful")
+    logger.info(f"Loading completed: {successful_chunks}/{len(id_ranges)} ranges successful")
     logger.info(f"Total records loaded: {total_loaded}")
     
     if errors:
-        logger.warning(f"Failed chunks ({failed_chunks}): {errors}")
+        logger.warning(f"Failed ranges ({failed_chunks}): {errors}")
     
     # Close connection pool
     pool.disconnect()
 
 
+def load_data_single_threaded_pipeline(client, schema, data_size, dimension, datatype, include_id, batch_size=1000):
+    """Load data in single-threaded mode using Redis pipelining and just-in-time generation."""
+
+    total_loaded = 0
+
+    # Process in batches to manage memory
+    for batch_start in range(0, data_size, batch_size):
+        batch_count = min(batch_size, data_size - batch_start)
+
+        # Generate embeddings just-in-time for this batch
+        batch_embeddings = generate_fake_embeddings_range(
+            batch_start, batch_count, dimension, datatype
+        )
+
+        # Create pipeline without transactions
+        pipe = client.pipeline(transaction=False)
+
+        # Add all batch operations to pipeline
+        for i, embedding in enumerate(batch_embeddings):
+            doc_id = batch_start + i
+
+            # Prepare the hash fields
+            hash_key = f"{schema.index.name}:{doc_id}"
+            fields = {"vector": embedding.tobytes()}
+
+            if include_id:
+                fields["id"] = f"document:{doc_id}"
+
+            # Add to pipeline
+            pipe.hset(hash_key, mapping=fields)
+
+        # Execute the batch
+        pipe.execute()
+        total_loaded += batch_count
+
+        # Log progress
+        if batch_start + batch_count < data_size:
+            logger.info(f"Single-threaded: Loaded {total_loaded}/{data_size} records")
+
+    logger.info(f"Single-threaded loading completed: {total_loaded} records loaded")
+
+
 def load_data(client, schema, data_size, dimension, datatype, include_id=True, max_workers=1):
-    """Load data operation: create index and load embeddings."""
+    """Load data operation: create index and load embeddings with improved memory efficiency."""
     logger.info("=== LOAD OPERATION ===")
     
     # Create the index
@@ -212,46 +307,27 @@ def load_data(client, schema, data_size, dimension, datatype, include_id=True, m
         index = SearchIndex(schema, client, validate_on_load=False)
         index.create(overwrite=True, drop=True)
     
-    # Generate embeddings
-    with timer("Generating fake embeddings"):
-        fake_embeddings = generate_fake_embeddings(data_size, dimension, datatype)
-
-    # Prepare data
-    with timer("Data preparation "):
-        if include_id:
-            data = [{"id": f"document:{i}", "vector": e.tobytes()} for i, e in enumerate(fake_embeddings)]
-        else:
-            data = [{"vector": e.tobytes()} for e in fake_embeddings]
-  
-    with timer("Data Loading into index"):
-        logger.info("Starting data loading into index.")
+    # Load data using just-in-time generation and Redis pipelining
+    with timer("Data Loading with pipelining"):
+        logger.info("Starting data loading with just-in-time generation and Redis pipelining.")
         
         if max_workers == 1:
-            # Single-threaded path (original behavior)
-            index.load(data)
+            # Single-threaded path with pipelining
+            logger.info("Using single-threaded mode with Redis pipelining")
+            load_data_single_threaded_pipeline(client, schema, data_size, dimension, datatype, include_id)
         else:
-            # Multi-threaded path
-            load_data_concurrent(client, schema, data, max_workers)
-    
-        
+            # Multi-threaded path with pipelining
+            logger.info(f"Using concurrent mode with {max_workers} workers and Redis pipelining")
+            load_data_concurrent_pipeline(client, schema, data_size, dimension, datatype, include_id, max_workers)
 
 
-def execute_single_query(schema, connection_pool, query_embedding, num_results, query_id):
-    """Execute a single query using a connection from the pool."""
-    
-    # Get connection from pool
-    redis_client = Redis(connection_pool=connection_pool)
-    
+def execute_single_query_optimized(worker_index, query_embedding, num_results, query_id):
+    """Execute a single query using a pre-created SearchIndex."""
     try:
-        # Create SearchIndex with pooled connection
-        worker_index = SearchIndex(schema, redis_client, validate_on_load=False)
-        
-        # Start timing
         start_time = time.perf_counter()
         
-        # Execute query
         query = VectorQuery(
-            vector=query_embedding.tolist(),  # Convert numpy array to list
+            vector=query_embedding.tolist(),
             vector_field_name="vector",
             num_results=num_results,
             return_fields=["vector"],
@@ -259,10 +335,7 @@ def execute_single_query(schema, connection_pool, query_embedding, num_results, 
         )
         results = worker_index.query(query)
         
-        # End timing
         end_time = time.perf_counter()
-        
-        # Calculate latency in milliseconds
         latency_ms = (end_time - start_time) * 1000
         
         return {
@@ -280,17 +353,37 @@ def execute_single_query(schema, connection_pool, query_embedding, num_results, 
             'success': False,
             'error': str(e)
         }
-    
-    finally:
-        # Connection automatically returns to pool when redis_client goes out of scope
-        pass
+
+
+
+def create_worker_search_indexes(schema, connection_pool, num_workers):
+    """Create a pool of SearchIndex objects for workers to reuse."""
+    search_indexes = []
+
+    for i in range(num_workers):
+        try:
+            # Create connection from pool
+            redis_client = Redis(connection_pool=connection_pool)
+
+            # Create SearchIndex
+            worker_index = SearchIndex(schema, redis_client, validate_on_load=False)
+            search_indexes.append(worker_index)
+
+            logger.debug(f"Created SearchIndex {i} for worker pool")
+
+        except Exception as e:
+            logger.error(f"Failed to create SearchIndex {i}: {e}")
+            raise
+
+    logger.info(f"Created {len(search_indexes)} SearchIndex objects for worker pool")
+    return search_indexes
 
 
 def _execute_query(index, query_embedding, num_results, query_id):
     """Helper function to execute a single query and return timing/result info."""
     try:
         start_time = time.perf_counter()
-        
+
         query = VectorQuery(
             vector=query_embedding.tolist(),
             vector_field_name="vector",
@@ -299,10 +392,10 @@ def _execute_query(index, query_embedding, num_results, query_id):
             return_score=True,
         )
         results = index.query(query)
-        
+
         end_time = time.perf_counter()
         latency_ms = (end_time - start_time) * 1000
-        
+
         return {
             'query_id': query_id,
             'latency_ms': latency_ms,
@@ -360,69 +453,123 @@ def _run_queries_single_threaded(index, query_embeddings, num_results):
 
 
 def _run_queries_concurrent(client, schema, query_embeddings, num_results, max_workers):
-    """Execute queries in concurrent mode using connection pool."""
-    # Create connection pool
-    connection_kwargs = client.connection_pool.connection_kwargs.copy()
-    pool = ConnectionPool(
-        host=connection_kwargs.get('host', 'localhost'),
-        port=connection_kwargs.get('port', 6379),
-        password=connection_kwargs.get('password', None),
-        db=connection_kwargs.get('db', 0),
-        max_connections=max_workers + 2
-    )
+    """Execute queries in concurrent mode using ThreadPoolExecutor with pre-created SearchIndex objects."""
+    # Use the existing client's connection pool
+    connection_pool = client.connection_pool
     
+    # Create SearchIndex objects upfront for workers to reuse
+    with timer("Creating SearchIndex pool"):
+        search_indexes = create_worker_search_indexes(schema, connection_pool, max_workers)
+
     # Thread-safe result tracking
     results_lock = threading.Lock()
-    latencies = []
-    successful_queries = 0
-    failed_queries = 0
-    completed_queries = 0
+    results_dict = {}
     
     start_time = time.perf_counter()
     last_print_time = start_time
     
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all query tasks
-        future_to_query = {
-            executor.submit(execute_single_query, schema, pool, embedding, num_results, i): i
-            for i, embedding in enumerate(query_embeddings)
-        }
+    # Distribute queries among workers
+    queries_per_worker = len(query_embeddings) // max_workers
+    query_chunks = []
+
+    for worker_id in range(max_workers):
+        start_idx = worker_id * queries_per_worker
+        if worker_id == max_workers - 1:  # Last worker gets remaining queries
+            end_idx = len(query_embeddings)
+        else:
+            end_idx = start_idx + queries_per_worker
         
-        # Process completed tasks
-        for future in as_completed(future_to_query):
-            query_id = future_to_query[future]
-            
-            try:
-                result = future.result()
-                
-                with results_lock:
-                    completed_queries += 1
-                    
-                    if result['success']:
-                        successful_queries += 1
-                        latencies.append(result['latency_ms'])
-                    else:
-                        failed_queries += 1
-                    
-                    # Update live statistics
-                    current_time = time.perf_counter()
-                    if current_time - last_print_time >= 1.0 or completed_queries == len(query_embeddings):
-                        elapsed_time = current_time - start_time
-                        success_rate = (successful_queries / completed_queries) * 100 if completed_queries > 0 else 0
-                        qps = successful_queries / elapsed_time if elapsed_time > 0 else 0
-                        calculate_and_print_live_stats(latencies, elapsed_time, completed_queries, success_rate, qps)
-                        last_print_time = current_time
-                        
-            except Exception as e:
-                logger.error(f"Query {query_id} processing failed: {e}")
-                with results_lock:
-                    failed_queries += 1
-                    completed_queries += 1
+        # Create list of (query_id, query_embedding) tuples for this worker
+        chunk = [(i, query_embeddings[i]) for i in range(start_idx, end_idx)]
+        if chunk:  # Only add non-empty chunks
+            query_chunks.append((worker_id, chunk))
     
-    pool.disconnect()
+    logger.info(f"Distributed {len(query_embeddings)} queries across {len(query_chunks)} chunks")
+
+    # Use ThreadPoolExecutor to process chunks
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit chunk processing tasks
+        future_to_worker = {}
+
+        for worker_id, query_chunk in query_chunks:
+            # Assign pre-created SearchIndex to this chunk
+            worker_search_index = search_indexes[worker_id]
+
+            future = executor.submit(
+                process_query_chunk_with_index,
+                worker_id, worker_search_index, query_chunk, num_results
+            )
+            future_to_worker[future] = worker_id
+
+        # Monitor progress as chunks complete
+        completed_chunks = 0
+        total_chunks = len(query_chunks)
+
+        for future in as_completed(future_to_worker):
+            worker_id = future_to_worker[future]
+
+            try:
+                chunk_results = future.result()
+                completed_chunks += 1
+
+                # Merge chunk results into main results dict
+                with results_lock:
+                    results_dict.update(chunk_results)
+
+                # Update live statistics
+                current_time = time.perf_counter()
+                if current_time - last_print_time >= 1.0 or completed_chunks == total_chunks:
+                    with results_lock:
+                        completed_queries = len(results_dict)
+                        successful_queries = sum(1 for result in results_dict.values() if result['success'])
+                        latencies = [result['latency_ms'] for result in results_dict.values() if result['success']]
+
+                    elapsed_time = current_time - start_time
+                    success_rate = (successful_queries / completed_queries) * 100 if completed_queries > 0 else 0
+                    qps = successful_queries / elapsed_time if elapsed_time > 0 else 0
+                    calculate_and_print_live_stats(latencies, elapsed_time, completed_queries, success_rate, qps)
+                    last_print_time = current_time
+
+                logger.debug(f"Worker {worker_id} completed chunk with {len(chunk_results)} results")
+
+            except Exception as e:
+                logger.error(f"Worker {worker_id} chunk processing failed: {e}")
+                completed_chunks += 1
+
+    # Final statistics
     total_time = time.perf_counter() - start_time
+    successful_queries = sum(1 for result in results_dict.values() if result['success'])
+    failed_queries = len(query_embeddings) - successful_queries
+    latencies = [result['latency_ms'] for result in results_dict.values() if result['success']]
     
     return latencies, successful_queries, failed_queries, total_time
+
+
+def process_query_chunk_with_index(worker_id, worker_index, query_chunk, num_results):
+    """Process a chunk of queries using a pre-created SearchIndex. Returns results dict."""
+    chunk_results = {}
+
+    try:
+        logger.debug(f"Worker {worker_id} processing {len(query_chunk)} queries with reused SearchIndex")
+
+        # Process all queries in this chunk
+        for query_id, query_embedding in query_chunk:
+            result = execute_single_query_optimized(worker_index, query_embedding, num_results, query_id)
+            chunk_results[query_id] = result
+
+        return chunk_results
+
+    except Exception as e:
+        logger.error(f"Worker {worker_id} failed: {e}")
+        # Return error results for all queries in this chunk
+        for query_id, _ in query_chunk:
+            chunk_results[query_id] = {
+                'query_id': query_id,
+                'latency_ms': None,
+                'success': False,
+                'error': f"Worker {worker_id} failed: {str(e)}"
+            }
+        return chunk_results
 
 
 def query_data(client, schema, dimension, datatype, query_count=100, num_results=10, max_workers=1):
