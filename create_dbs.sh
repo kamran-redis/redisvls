@@ -45,7 +45,7 @@ curl -vvv -k -X "POST" "$RS_URL/v1/bdbs" \
   "type": "redis",
   "replication": false,
   "memory_size": $MEMORY_SIZE,
-  "name": "search1qbf4",
+  "name": "search1qpf4",
   "port": 13000
 }
 EOF
@@ -77,7 +77,7 @@ curl -vvv -k -X "POST" "$RS_URL/v1/bdbs" \
   "sharding": true,
   "replication": false,
   "memory_size": $MEMORY_SIZE,
-  "name": "search2qbf4",
+  "name": "search2qpf4",
   "port": 14000
 }
 EOF
@@ -109,7 +109,7 @@ curl -vvv -k -X "POST" "$RS_URL/v1/bdbs" \
   "replication": false,
   "memory_size": $MEMORY_SIZE,
   "shards_placement": "sparse",
-  "name": "search8qbf4",
+  "name": "search8qpf4",
   "port": 15000
 }
 EOF
@@ -141,7 +141,7 @@ curl -vvv -k -X "POST" "$RS_URL/v1/bdbs" \
   "replication": false,
   "memory_size": $MEMORY_SIZE,
   "shards_placement": "sparse",
-  "name": "search16qbf4",
+  "name": "search16qpf4",
   "port": 16000
 }
 EOF
