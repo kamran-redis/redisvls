@@ -1,7 +1,9 @@
 import os
 import time
 import logging
+import queue
 from contextlib import contextmanager
+from typing import List, Tuple, Dict, Optional, Union, Iterator, Any
 import typer
 from redis import Redis
 from redis.connection import ConnectionPool
@@ -37,7 +39,7 @@ DEFAULT_SEED = 42
 
 
 @contextmanager
-def timer(operation_name="Operation"):
+def timer(operation_name: str = "Operation") -> Iterator[None]:
     """Context manager for timing operations."""
     start_time = time.perf_counter()
     yield
@@ -45,44 +47,34 @@ def timer(operation_name="Operation"):
     logger.info(f"{operation_name} took: {end_time - start_time:.4f} seconds")
 
 
-def validate_choice_argument(value, valid_choices, arg_name):
+def validate_choice_argument(value: str, valid_choices: List[str], arg_name: str) -> None:
     """Validate that a value is in the list of valid choices."""
     if value not in valid_choices:
         logger.error(f"{arg_name} must be one of {valid_choices}, got: {value}")
         raise typer.Exit(1)
 
 
-def get_numpy_dtype(datatype_str):
+def get_numpy_dtype(datatype_str: str) -> np.dtype:
     """Convert datatype string to numpy dtype."""
-    dtype_map = {"float32": np.float32}
+    dtype_map: Dict[str, np.dtype] = {"float32": np.float32}
     if datatype_str not in dtype_map:
         raise ValueError(f"Unsupported datatype: {datatype_str}. Only {list(dtype_map.keys())} are supported.")
     return dtype_map[datatype_str]
 
 
-def generate_fake_embeddings(num_embeddings, embedding_dim, datatype_str, seed=DEFAULT_SEED):
-    """Generate fake embeddings using random numbers."""
-    if seed is not None:
-        np.random.seed(seed)
-    
-    dtype = get_numpy_dtype(datatype_str)
-    embeddings = np.random.rand(num_embeddings, embedding_dim).astype(dtype)
-    return embeddings
-
-
-def generate_fake_embeddings_range(start_id, count, embedding_dim, datatype_str, seed=DEFAULT_SEED):
-    """Generate fake embeddings for a specific ID range using deterministic seeding."""
+def generate_fake_embeddings(num_embeddings: int, embedding_dim: int, datatype_str: str, seed: Optional[int] = DEFAULT_SEED, start_id: int = 0) -> np.ndarray:
+    """Generate fake embeddings using random numbers with deterministic seeding."""
     # Use the start_id as an offset to ensure different workers generate different data
     # but still deterministically based on the base seed
     if seed is not None:
         np.random.seed(seed + start_id)
 
     dtype = get_numpy_dtype(datatype_str)
-    embeddings = np.random.rand(count, embedding_dim).astype(dtype)
+    embeddings = np.random.rand(num_embeddings, embedding_dim).astype(dtype)
     return embeddings
 
 
-def create_schema(index_name, dimension, distance_metric, algorithm, datatype, include_id=True):
+def create_schema(index_name: str, dimension: int, distance_metric: str, algorithm: str, datatype: str, include_id: bool = True) -> IndexSchema:
     """Create and return the index schema."""
     fields = [
         {
@@ -110,8 +102,8 @@ def create_schema(index_name, dimension, distance_metric, algorithm, datatype, i
     })
 
 
-def load_chunk_with_pipeline(connection_pool, index_name, start_id, count, dimension, datatype, include_id, chunk_id, batch_size=1000):
-    """Load a chunk using Redis pipeline without transactions for efficient batching."""
+def _load_worker(connection_pool: ConnectionPool, index_name: str, start_id: int, count: int, dimension: int, datatype: str, include_id: bool, worker_id: int, batch_size: int = 1000) -> int:
+    """Load worker using Redis pipeline without transactions for efficient batching."""
     
     # Get connection from pool
     redis_client = Redis(connection_pool=connection_pool)
@@ -125,8 +117,8 @@ def load_chunk_with_pipeline(connection_pool, index_name, start_id, count, dimen
             current_start_id = start_id + batch_start
 
             # Generate embeddings just-in-time for this batch
-            batch_embeddings = generate_fake_embeddings_range(
-                current_start_id, batch_count, dimension, datatype
+            batch_embeddings = generate_fake_embeddings(
+                batch_count, dimension, datatype, start_id=current_start_id
             )
 
             # Create pipeline without transactions for better performance
@@ -150,15 +142,15 @@ def load_chunk_with_pipeline(connection_pool, index_name, start_id, count, dimen
             pipe.execute()
             total_loaded += batch_count
 
-            # Optional: Log progress for large chunks
+            # Optional: Log progress for large batches
             if batch_start + batch_count < count:
-                logger.debug(f"Chunk {chunk_id}: Loaded {total_loaded}/{count} records")
+                logger.debug(f"Worker {worker_id}: Loaded {total_loaded}/{count} records")
 
-        logger.info(f"Chunk {chunk_id} completed: {total_loaded} records loaded")
+        logger.info(f"Worker {worker_id} completed: {total_loaded} records loaded")
         return total_loaded
 
     except Exception as e:
-        logger.error(f"Worker {chunk_id} error loading {count} records starting from ID {start_id}: {e}")
+        logger.error(f"Worker {worker_id} error loading {count} records starting from ID {start_id}: {e}")
         raise
 
     finally:
@@ -166,29 +158,29 @@ def load_chunk_with_pipeline(connection_pool, index_name, start_id, count, dimen
         pass
 
 
-def calculate_id_ranges(data_size, max_workers):
+def _calculate_worker_ranges(data_size, max_workers):
     """Calculate ID ranges for each worker to ensure even distribution."""
-    ranges = []
+    worker_ranges = []
 
     if max_workers >= data_size:
         # More workers than data points - each worker gets 1 item max
         for i in range(data_size):
-            ranges.append((i, 1))
+            worker_ranges.append((i, 1))
     else:
-        chunk_size = data_size // max_workers
+        base_range_size = data_size // max_workers
 
         for i in range(max_workers):
-            start_id = i * chunk_size
-            if i == max_workers - 1:  # Last chunk gets all remaining data
+            start_id = i * base_range_size
+            if i == max_workers - 1:  # Last worker gets all remaining data
                 count = data_size - start_id
             else:
-                count = chunk_size
-            ranges.append((start_id, count))
+                count = base_range_size
+            worker_ranges.append((start_id, count))
 
-    return ranges
+    return worker_ranges
 
 
-def load_data_concurrent_pipeline(client, schema, data_size, dimension, datatype, include_id, max_workers):
+def _load_concurrent(client: Redis, schema: IndexSchema, data_size: int, dimension: int, datatype: str, include_id: bool, max_workers: int) -> None:
     """Load data concurrently using Redis pipelining for improved performance and memory usage."""
 
     # Create connection pool (reuse client's connection config)
@@ -202,20 +194,20 @@ def load_data_concurrent_pipeline(client, schema, data_size, dimension, datatype
     )
     
     # Calculate ID ranges for workers
-    id_ranges = calculate_id_ranges(data_size, max_workers)
-    logger.info(f"Split {data_size} records into {len(id_ranges)} ranges for {max_workers} workers")
+    worker_ranges = _calculate_worker_ranges(data_size, max_workers)
+    logger.info(f"Split {data_size} records into {len(worker_ranges)} ranges for {max_workers} workers")
     
     # Track results
-    successful_chunks = 0
-    failed_chunks = 0
+    successful_workers = 0
+    failed_workers = 0
     total_loaded = 0
-    errors = []
+    errors: List[str] = []
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all chunk loading tasks
-        future_to_range = {
+        # Submit all worker loading tasks
+        future_to_worker = {
             executor.submit(
-                load_chunk_with_pipeline,
+                _load_worker,
                 pool,
                 schema.index.name,  # Get index name from schema
                 start_id,
@@ -223,40 +215,40 @@ def load_data_concurrent_pipeline(client, schema, data_size, dimension, datatype
                 dimension,
                 datatype,
                 include_id,
-                i
+                i  # worker_id
             ): (start_id, count, i)
-            for i, (start_id, count) in enumerate(id_ranges)
+            for i, (start_id, count) in enumerate(worker_ranges)
         }
         
         # Process completed tasks as they finish
-        for future in as_completed(future_to_range):
-            start_id, count, chunk_id = future_to_range[future]
+        for future in as_completed(future_to_worker):
+            start_id, count, worker_id = future_to_worker[future]
             
             try:
                 records_loaded = future.result()
-                successful_chunks += 1
+                successful_workers += 1
                 total_loaded += records_loaded
-                logger.info(f"Range {chunk_id} (IDs {start_id}-{start_id + count - 1}) completed: {records_loaded} records loaded")
+                logger.info(f"Worker {worker_id} (IDs {start_id}-{start_id + count - 1}) completed: {records_loaded} records loaded")
                 
             except Exception as e:
-                failed_chunks += 1
-                error_msg = f"Range {chunk_id} (IDs {start_id}-{start_id + count - 1}) failed: {str(e)}"
+                failed_workers += 1
+                error_msg = f"Worker {worker_id} (IDs {start_id}-{start_id + count - 1}) failed: {str(e)}"
                 errors.append(error_msg)
                 logger.error(error_msg)
-                # Continue with other chunks - don't stop execution
+                # Continue with other workers - don't stop execution
     
     # Final reporting
-    logger.info(f"Loading completed: {successful_chunks}/{len(id_ranges)} ranges successful")
+    logger.info(f"Loading completed: {successful_workers}/{len(worker_ranges)} workers successful")
     logger.info(f"Total records loaded: {total_loaded}")
     
     if errors:
-        logger.warning(f"Failed ranges ({failed_chunks}): {errors}")
+        logger.warning(f"Failed workers ({failed_workers}): {errors}")
     
     # Close connection pool
     pool.disconnect()
 
 
-def load_data_single_threaded_pipeline(client, schema, data_size, dimension, datatype, include_id, batch_size=1000):
+def _load_single_threaded(client: Redis, schema: IndexSchema, data_size: int, dimension: int, datatype: str, include_id: bool, batch_size: int = 1000) -> None:
     """Load data in single-threaded mode using Redis pipelining and just-in-time generation."""
 
     total_loaded = 0
@@ -266,8 +258,8 @@ def load_data_single_threaded_pipeline(client, schema, data_size, dimension, dat
         batch_count = min(batch_size, data_size - batch_start)
 
         # Generate embeddings just-in-time for this batch
-        batch_embeddings = generate_fake_embeddings_range(
-            batch_start, batch_count, dimension, datatype
+        batch_embeddings = generate_fake_embeddings(
+            batch_count, dimension, datatype, start_id=batch_start
         )
 
         # Create pipeline without transactions
@@ -291,14 +283,14 @@ def load_data_single_threaded_pipeline(client, schema, data_size, dimension, dat
         pipe.execute()
         total_loaded += batch_count
 
-        # Log progress
+        # Log progress for batches
         if batch_start + batch_count < data_size:
             logger.info(f"Single-threaded: Loaded {total_loaded}/{data_size} records")
 
     logger.info(f"Single-threaded loading completed: {total_loaded} records loaded")
 
 
-def load_data(client, schema, data_size, dimension, datatype, include_id=True, max_workers=1):
+def load_data(client: Redis, schema: IndexSchema, data_size: int, dimension: int, datatype: str, include_id: bool = True, max_workers: int = 1) -> None:
     """Load data operation: create index and load embeddings with improved memory efficiency."""
     logger.info("=== LOAD OPERATION ===")
     
@@ -314,26 +306,25 @@ def load_data(client, schema, data_size, dimension, datatype, include_id=True, m
         if max_workers == 1:
             # Single-threaded path with pipelining
             logger.info("Using single-threaded mode with Redis pipelining")
-            load_data_single_threaded_pipeline(client, schema, data_size, dimension, datatype, include_id)
+            _load_single_threaded(client, schema, data_size, dimension, datatype, include_id)
         else:
             # Multi-threaded path with pipelining
             logger.info(f"Using concurrent mode with {max_workers} workers and Redis pipelining")
-            load_data_concurrent_pipeline(client, schema, data_size, dimension, datatype, include_id, max_workers)
+            _load_concurrent(client, schema, data_size, dimension, datatype, include_id, max_workers)
 
 
-def execute_single_query_optimized(worker_index, query_embedding, num_results, query_id):
-    """Execute a single query using a pre-created SearchIndex."""
+def execute_query(index: SearchIndex, query_embedding: np.ndarray, num_results: int, query_id: int) -> Dict[str, Any]:
+    """Execute a single query and return timing/result info."""
     try:
         start_time = time.perf_counter()
         
         query = VectorQuery(
-            vector=query_embedding.tolist(),
+            vector=query_embedding.tobytes(),
             vector_field_name="vector",
             num_results=num_results,
-            return_fields=["vector"],
             return_score=True,
         )
-        results = worker_index.query(query)
+        results = index.query(query)
         
         end_time = time.perf_counter()
         latency_ms = (end_time - start_time) * 1000
@@ -355,64 +346,55 @@ def execute_single_query_optimized(worker_index, query_embedding, num_results, q
         }
 
 
-
-def create_worker_search_indexes(schema, connection_pool, num_workers):
-    """Create a pool of SearchIndex objects for workers to reuse."""
-    search_indexes = []
-
-    for i in range(num_workers):
-        try:
-            # Create connection from pool
-            redis_client = Redis(connection_pool=connection_pool)
-
-            # Create SearchIndex
-            worker_index = SearchIndex(schema, redis_client, validate_on_load=False)
-            search_indexes.append(worker_index)
-
-            logger.debug(f"Created SearchIndex {i} for worker pool")
-
-        except Exception as e:
-            logger.error(f"Failed to create SearchIndex {i}: {e}")
-            raise
-
-    logger.info(f"Created {len(search_indexes)} SearchIndex objects for worker pool")
-    return search_indexes
-
-
-def _execute_query(index, query_embedding, num_results, query_id):
-    """Helper function to execute a single query and return timing/result info."""
-    try:
-        start_time = time.perf_counter()
-
-        query = VectorQuery(
-            vector=query_embedding.tolist(),
-            vector_field_name="vector",
-            num_results=num_results,
-            return_fields=["vector"],
-            return_score=True,
-        )
-        results = index.query(query)
-
-        end_time = time.perf_counter()
-        latency_ms = (end_time - start_time) * 1000
-
-        return {
-            'query_id': query_id,
-            'latency_ms': latency_ms,
-            'success': True,
-            'results': results
-        }
-    except Exception as e:
-        logger.error(f"Query {query_id} failed: {e}")
-        return {
-            'query_id': query_id,
-            'latency_ms': None,
-            'success': False,
-            'error': str(e)
-        }
+def _create_optimized_worker_pool(schema: IndexSchema, client: Redis, max_workers: int) -> Tuple[List[SearchIndex], ConnectionPool]:
+    """Create optimized connection pool and SearchIndex objects with retry logic."""
+    
+    # Size connection pool generously for concurrent access
+    # Each SearchIndex may need multiple connections for different operations
+    connection_kwargs = client.connection_pool.connection_kwargs.copy()
+    optimized_pool = ConnectionPool(
+        host=connection_kwargs.get('host', 'localhost'),
+        port=connection_kwargs.get('port', 6379),
+        password=connection_kwargs.get('password', None),
+        db=connection_kwargs.get('db', 0),
+        max_connections=max_workers * 2,  # More generous sizing
+        retry_on_timeout=True,
+        socket_keepalive=True,
+        socket_keepalive_options={}
+    )
+    
+    # Create SearchIndex objects with dedicated connections
+    search_indexes: List[SearchIndex] = []
+    for i in range(max_workers):
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Each worker gets its own Redis client from the pool
+                worker_redis = Redis(connection_pool=optimized_pool)
+                
+                # Test connection
+                worker_redis.ping()
+                
+                # Create SearchIndex with dedicated connection
+                worker_index = SearchIndex(schema, worker_redis, validate_on_load=False)
+                search_indexes.append(worker_index)
+                
+                logger.debug(f"Created SearchIndex {i} with dedicated connection")
+                break
+                
+            except Exception as e:
+                logger.warning(f"SearchIndex {i} creation attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries - 1:
+                    # Close pool on final failure
+                    optimized_pool.disconnect()
+                    raise
+                time.sleep(0.1 * (attempt + 1))  # Exponential backoff
+    
+    logger.info(f"Created {len(search_indexes)} SearchIndex objects with optimized connection pool")
+    return search_indexes, optimized_pool
 
 
-def _process_query_results(latencies, successful_queries, completed_queries, total_queries, start_time, last_print_time):
+def _process_query_results(latencies: List[float], successful_queries: int, completed_queries: int, total_queries: int, start_time: float, last_print_time: float) -> float:
     """Helper function to calculate and print live statistics during query execution."""
     current_time = time.perf_counter()
     should_print = (current_time - last_print_time >= 1.0) or (completed_queries == total_queries)
@@ -427,15 +409,15 @@ def _process_query_results(latencies, successful_queries, completed_queries, tot
     return last_print_time
 
 
-def _run_queries_single_threaded(index, query_embeddings, num_results):
+def _run_queries_single_threaded(index: SearchIndex, query_embeddings: np.ndarray, num_results: int) -> Tuple[List[float], int, int, float]:
     """Execute queries in single-threaded mode."""
-    latencies = []
+    latencies: List[float] = []
     successful_queries = 0
     start_time = time.perf_counter()
     last_print_time = start_time
     
     for i, embedding in enumerate(query_embeddings):
-        result = _execute_query(index, embedding, num_results, i)
+        result = execute_query(index, embedding, num_results, i)
         
         if result['success']:
             latencies.append(result['latency_ms'])
@@ -452,127 +434,128 @@ def _run_queries_single_threaded(index, query_embeddings, num_results):
     return latencies, successful_queries, failed_queries, total_time
 
 
-def _run_queries_concurrent(client, schema, query_embeddings, num_results, max_workers):
-    """Execute queries in concurrent mode using ThreadPoolExecutor with pre-created SearchIndex objects."""
-    # Use the existing client's connection pool
-    connection_pool = client.connection_pool
+def _run_queries_concurrent(client: Redis, schema: IndexSchema, query_embeddings: np.ndarray, num_results: int, max_workers: int) -> Tuple[List[float], int, int, float]:
+    """Execute queries using queue-based approach with optimized connection management."""
     
-    # Create SearchIndex objects upfront for workers to reuse
-    with timer("Creating SearchIndex pool"):
-        search_indexes = create_worker_search_indexes(schema, connection_pool, max_workers)
-
-    # Thread-safe result tracking
-    results_lock = threading.Lock()
-    results_dict = {}
+    # Create optimized worker pool
+    search_indexes, connection_pool = _create_optimized_worker_pool(schema, client, max_workers)
     
-    start_time = time.perf_counter()
-    last_print_time = start_time
-    
-    # Distribute queries among workers
-    queries_per_worker = len(query_embeddings) // max_workers
-    query_chunks = []
-
-    for worker_id in range(max_workers):
-        start_idx = worker_id * queries_per_worker
-        if worker_id == max_workers - 1:  # Last worker gets remaining queries
-            end_idx = len(query_embeddings)
-        else:
-            end_idx = start_idx + queries_per_worker
+    try:
+        # Create and populate queue
+        query_queue: queue.Queue = queue.Queue()
+        for i, embedding in enumerate(query_embeddings):
+            query_queue.put((i, embedding))
         
-        # Create list of (query_id, query_embedding) tuples for this worker
-        chunk = [(i, query_embeddings[i]) for i in range(start_idx, end_idx)]
-        if chunk:  # Only add non-empty chunks
-            query_chunks.append((worker_id, chunk))
-    
-    logger.info(f"Distributed {len(query_embeddings)} queries across {len(query_chunks)} chunks")
-
-    # Use ThreadPoolExecutor to process chunks
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit chunk processing tasks
-        future_to_worker = {}
-
-        for worker_id, query_chunk in query_chunks:
-            # Assign pre-created SearchIndex to this chunk
-            worker_search_index = search_indexes[worker_id]
-
-            future = executor.submit(
-                process_query_chunk_with_index,
-                worker_id, worker_search_index, query_chunk, num_results
-            )
-            future_to_worker[future] = worker_id
-
-        # Monitor progress as chunks complete
-        completed_chunks = 0
-        total_chunks = len(query_chunks)
-
-        for future in as_completed(future_to_worker):
-            worker_id = future_to_worker[future]
-
-            try:
-                chunk_results = future.result()
-                completed_chunks += 1
-
-                # Merge chunk results into main results dict
-                with results_lock:
-                    results_dict.update(chunk_results)
-
+        # Add sentinel values for clean shutdown
+        for _ in range(max_workers):
+            query_queue.put(None)
+        
+        logger.info(f"Queued {len(query_embeddings)} queries for processing by {max_workers} workers")
+        
+        # Thread-safe result collection
+        results_dict: Dict[int, Dict[str, Any]] = {}
+        results_lock = threading.Lock()
+        
+        # Track timing for live statistics
+        start_time = time.perf_counter()
+        last_print_time = start_time
+        
+        # Launch workers with their own RedisVL index connections
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
+                    _query_worker,
+                    i,  # worker_id
+                    query_queue,
+                    results_dict,
+                    results_lock,
+                    search_indexes[i],  # worker-specific SearchIndex
+                    num_results
+                ) for i in range(max_workers)
+            ]
+            
+            # Monitor progress while workers process queries
+            while True:
+                # Check if all workers have finished
+                all_done = all(future.done() for future in futures)
+                
                 # Update live statistics
                 current_time = time.perf_counter()
-                if current_time - last_print_time >= 1.0 or completed_chunks == total_chunks:
+                if current_time - last_print_time >= 1.0 or all_done:
                     with results_lock:
                         completed_queries = len(results_dict)
                         successful_queries = sum(1 for result in results_dict.values() if result['success'])
                         latencies = [result['latency_ms'] for result in results_dict.values() if result['success']]
-
-                    elapsed_time = current_time - start_time
-                    success_rate = (successful_queries / completed_queries) * 100 if completed_queries > 0 else 0
-                    qps = successful_queries / elapsed_time if elapsed_time > 0 else 0
-                    calculate_and_print_live_stats(latencies, elapsed_time, completed_queries, success_rate, qps)
+                    
+                    if completed_queries > 0:
+                        elapsed_time = current_time - start_time
+                        success_rate = (successful_queries / completed_queries) * 100
+                        qps = successful_queries / elapsed_time if elapsed_time > 0 else 0
+                        calculate_and_print_live_stats(latencies, elapsed_time, completed_queries, success_rate, qps)
+                    
                     last_print_time = current_time
-
-                logger.debug(f"Worker {worker_id} completed chunk with {len(chunk_results)} results")
-
-            except Exception as e:
-                logger.error(f"Worker {worker_id} chunk processing failed: {e}")
-                completed_chunks += 1
-
-    # Final statistics
-    total_time = time.perf_counter() - start_time
-    successful_queries = sum(1 for result in results_dict.values() if result['success'])
-    failed_queries = len(query_embeddings) - successful_queries
-    latencies = [result['latency_ms'] for result in results_dict.values() if result['success']]
+                
+                if all_done:
+                    break
+                    
+                time.sleep(0.1)  # Small delay to prevent busy waiting
+            
+            # Wait for all workers to finish
+            for future in futures:
+                future.result()
+        
+        # Calculate final statistics
+        total_time = time.perf_counter() - start_time
+        successful_queries = sum(1 for result in results_dict.values() if result['success'])
+        failed_queries = len(query_embeddings) - successful_queries
+        latencies = [result['latency_ms'] for result in results_dict.values() if result['success']]
+        
+        return latencies, successful_queries, failed_queries, total_time
     
-    return latencies, successful_queries, failed_queries, total_time
+    finally:
+        # Clean up connection pool
+        connection_pool.disconnect()
+        logger.debug("Connection pool disconnected")
 
 
-def process_query_chunk_with_index(worker_id, worker_index, query_chunk, num_results):
-    """Process a chunk of queries using a pre-created SearchIndex. Returns results dict."""
-    chunk_results = {}
+def _query_worker(worker_id: int, query_queue: queue.Queue, results_dict: Dict[int, Dict[str, Any]], results_lock: threading.Lock, search_index: SearchIndex, num_results: int) -> None:
+    """Worker function that pulls queries from queue until sentinel received."""
+    processed_count = 0
+    
+    while True:
+        try:
+            # Block until item available (no timeout needed)
+            query_item = query_queue.get()
+            
+            # Check for sentinel value (clean shutdown)
+            if query_item is None:
+                query_queue.task_done()
+                logger.debug(f"Worker {worker_id} received shutdown signal after processing {processed_count} queries")
+                break
+                
+            query_id, query_embedding = query_item
+            
+            # Execute the query
+            result = execute_query(search_index, query_embedding, num_results, query_id)
+            
+            # Store result thread-safely
+            with results_lock:
+                results_dict[query_id] = result
+            
+            processed_count += 1
+            
+            # Mark task as done
+            query_queue.task_done()
+            
+        except Exception as e:
+            logger.error(f"Worker {worker_id} error processing query: {e}")
+            # Still mark as done to prevent queue.join() from hanging
+            query_queue.task_done()
+    
+    logger.debug(f"Worker {worker_id} finished processing {processed_count} queries")
 
-    try:
-        logger.debug(f"Worker {worker_id} processing {len(query_chunk)} queries with reused SearchIndex")
 
-        # Process all queries in this chunk
-        for query_id, query_embedding in query_chunk:
-            result = execute_single_query_optimized(worker_index, query_embedding, num_results, query_id)
-            chunk_results[query_id] = result
-
-        return chunk_results
-
-    except Exception as e:
-        logger.error(f"Worker {worker_id} failed: {e}")
-        # Return error results for all queries in this chunk
-        for query_id, _ in query_chunk:
-            chunk_results[query_id] = {
-                'query_id': query_id,
-                'latency_ms': None,
-                'success': False,
-                'error': f"Worker {worker_id} failed: {str(e)}"
-            }
-        return chunk_results
-
-
-def query_data(client, schema, dimension, datatype, query_count=100, num_results=10, max_workers=1):
+def query_data(client: Redis, schema: IndexSchema, dimension: int, datatype: str, query_count: int = 100, num_results: int = 10, max_workers: int = 1) -> None:
     """Query operation: perform vector search queries and measure latency."""
     logger.info(f"Running {query_count} queries, returning {num_results} results each")
     

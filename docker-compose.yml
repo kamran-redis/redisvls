@@ -6,9 +6,9 @@ services:
     container_name: redis
     ports:
       - "6379:6379"
-    command: >
-      redis-server
-      --search-workers 4
+    # command: >
+    #   redis-server
+    #   --search-workers 4
     volumes:
       - redis_data:/data
     restart: unless-stopped
