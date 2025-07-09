@@ -10,7 +10,7 @@ redis_hosts=("localhost" "redis-12000.internal.cluster.kamran-default.demo.redis
 redis_ports=(6379 12000 13000 14000 15000 16000)
 algorithms=("flat" "hnsw")
 operations=("load" "query")
-workers=(1 16)
+workers=(1 4)
 
 # Calculate total number of operations (paired combinations)
 total_ops=$((${#redis_hosts[@]} * ${#algorithms[@]} * ${#operations[@]} * ${#workers[@]}))
